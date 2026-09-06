@@ -18,11 +18,90 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
+
+#include <uapi/linux/media-bus-format.h>
 
 #define hdmi_mutex_lock(x)	mutex_lock(x)
 #define hdmi_mutex_unlock(x)	mutex_unlock(x)
 
 #define HDMI_TX_PIXEL_MAXRATE	2376000
+
+/* VTC register offsets and bit masks */
+#define HDMI_TX_VTC_BASE			0x10000
+
+#define HDMI_TX_VTC_CTL			0x000
+#define HDMI_TX_VTC_CTL_MASK			GENMASK(18, 8)
+#define HDMI_TX_VTC_RST			BIT(31)
+#define HDMI_TX_VTC_CTL_GE			BIT(2)
+#define HDMI_TX_VTC_CTL_RU			BIT(1)
+
+#define HDMI_TX_VTC_GASIZE_F0			0x060
+#define HDMI_TX_VTC_ACTIVE_SIZE_MASK		GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GFENC			0x068
+#define HDMI_TX_VTC_GFENC_MASK			BIT(6)
+
+#define HDMI_TX_VTC_GPOL			0x06c
+#define HDMI_TX_VTC_GPOL_FIELD_ID_POL		BIT(6)
+#define HDMI_TX_VTC_ACTIVE_CHROMA_POL		BIT(5)
+#define HDMI_TX_VTC_ACTIVE_VIDEO_POL		BIT(4)
+#define HDMI_TX_VTC_HSYNC_POL			BIT(3)
+#define HDMI_TX_VTC_VSYNC_POL			BIT(2)
+#define HDMI_TX_VTC_HBLANK_POL			BIT(1)
+#define HDMI_TX_VTC_VBLANK_POL			BIT(0)
+#define HDMI_TX_VTC_GPOL_MASK		(HDMI_TX_VTC_VBLANK_POL |\
+					 HDMI_TX_VTC_HBLANK_POL |\
+					 HDMI_TX_VTC_VSYNC_POL |\
+					 HDMI_TX_VTC_HSYNC_POL |\
+					 HDMI_TX_VTC_ACTIVE_VIDEO_POL |\
+					 HDMI_TX_VTC_ACTIVE_CHROMA_POL)
+
+#define HDMI_TX_VTC_INT_GPOL_MASK	(HDMI_TX_VTC_GPOL_FIELD_ID_POL |\
+					 HDMI_TX_VTC_ACTIVE_CHROMA_POL |\
+					 HDMI_TX_VTC_ACTIVE_VIDEO_POL)
+
+#define HDMI_TX_VTC_GHSIZE			0x070
+#define HDMI_TX_VTC_GHSIZE_FRAME_HSIZE		GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GVSIZE			0x074
+#define HDMI_TX_VTC_FIELD1_VSIZE_SHIFT		16
+#define HDMI_TX_VTC_GVSIZE_FRAME_VSIZE		GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GHSYNC			0x078
+#define HDMI_TX_VTC_GH1BPSTART_SHIFT		16
+#define HDMI_TX_VTC_GHSYNC_END_MASK		GENMASK(29, 16)
+#define HDMI_TX_VTC_GHSYNC_START_MASK		GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GVBHOFF			0x07c
+#define HDMI_TX_VTC_F0VSYNC_HEND_SHIFT		16
+#define HDMI_TX_VTC_F0VBLANK_HEND_MASK		GENMASK(29, 16)
+#define HDMI_TX_VTC_F0VBLANK_HSTART_MASK	GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GVSYNC			0x080
+#define HDMI_TX_VTC_F0_VSYNC_VEND_MASK		GENMASK(29, 16)
+#define HDMI_TX_VTC_F0_VSYNC_VSTART_MASK	GENMASK(13, 0)
+
+#define HDMI_TX_VTC_GVSHOFF			0x084
+#define HDMI_TX_VTC_GVBHOFF_F1			0x088
+#define HDMI_TX_VTC_GVSYNC_F1			0x08c
+#define HDMI_TX_VTC_GVSHOFF_F1			0x090
+#define HDMI_TX_VTC_GASIZE_F1			0x094
+
+enum color_formats {
+	HDMI_TX_CSF_RGB = 0,
+	HDMI_TX_CSF_YCRCB_444 = 1,
+	HDMI_TX_CSF_YCRCB_422 = 2,
+	HDMI_TX_CSF_YCRCB_420 = 3
+};
+
+enum color_depths {
+	HDMI_TX_BPC_8 = 8,
+	HDMI_TX_BPC_10 = 10,
+	HDMI_TX_BPC_12 = 12,
+	HDMI_TX_BPC_16 = 16
+};
 
 /**
  * struct xlnx_hdmi - Xilinx HDMI core
@@ -33,6 +112,10 @@
  * @ddc: i2c ddc handle
  * @hdmi_mutex: mutex to lock hdmi structure
  * @dpms: current dpms state
+ * @xvidc_colorfmt: hdmi ip internal colorformat representation
+ * @xvidc_colordepth: color depth
+ * @tmds_clk: TMDS clock
+ * @saved_adjusted_mode: Copy of @drm_crtc_state.adjusted_mode
  */
 struct xlnx_hdmi {
 	struct device *dev;
@@ -43,7 +126,37 @@ struct xlnx_hdmi {
 	/* to lock hdmi */
 	struct mutex hdmi_mutex;
 	int dpms;
+	enum color_formats xvidc_colorfmt;
+	enum color_depths xvidc_colordepth;
+	u64 tmds_clk;
+	struct drm_display_mode saved_adjusted_mode;
 };
+
+/* video timing controller */
+#define xlnx_hdmi_vtc_enable(hdmi) \
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_CTL, HDMI_TX_VTC_CTL_GE)
+
+#define xlnx_hdmi_vtc_disable(hdmi) \
+	xlnx_hdmi_vtc_clr(hdmi, HDMI_TX_VTC_CTL, HDMI_TX_VTC_CTL_GE)
+
+static inline void
+xlnx_hdmi_vtc_writel(struct xlnx_hdmi *hdmi, u32 offset, u32 val)
+{
+	writel(val, hdmi->base + HDMI_TX_VTC_BASE + offset);
+}
+
+static inline u32
+xlnx_hdmi_vtc_readl(struct xlnx_hdmi *hdmi, u32 offset)
+{
+	return readl(hdmi->base + HDMI_TX_VTC_BASE + offset);
+}
+
+static inline void
+xlnx_hdmi_vtc_clr(struct xlnx_hdmi *hdmi, u32 offset, u32 clr)
+{
+	xlnx_hdmi_vtc_writel(hdmi, offset,
+			     xlnx_hdmi_vtc_readl(hdmi, offset) & ~clr);
+}
 
 static inline struct
 xlnx_hdmi *encoder_to_hdmi(struct drm_encoder *encoder)
@@ -55,6 +168,101 @@ static inline struct
 xlnx_hdmi *connector_to_hdmi(struct drm_connector *connector)
 {
 	return container_of(connector, struct xlnx_hdmi, connector);
+}
+
+/**
+ * xlnx_hdmi_vtc_set_timing - configure video timing parameters
+ * @hdmi: hdmi tx instance
+ * @mode: drm display mode
+ *
+ * Program timing parameters into video timing controller
+ * registers.
+ *
+ * @return: None
+ */
+static void xlnx_hdmi_vtc_set_timing(struct xlnx_hdmi *hdmi,
+				     struct drm_display_mode *mode)
+{
+	u32 reg;
+	u32 htotal, hactive, hsync_start, hbackporch_start;
+	u32 vtotal, vactive, vsync_start, vbackporch_start;
+	u32 hsync_len, hfront_porch, hback_porch;
+	u32 vsync_len, vfront_porch, vback_porch;
+
+	/* vtc reset */
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_CTL, HDMI_TX_VTC_RST);
+	reg = xlnx_hdmi_vtc_readl(hdmi, HDMI_TX_VTC_CTL);
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_CTL, reg | HDMI_TX_VTC_CTL_RU);
+
+	hactive = mode->hdisplay;
+	hfront_porch = (mode->hsync_start - mode->hdisplay);
+	hback_porch = (mode->htotal - mode->hsync_end);
+	hsync_len = (mode->hsync_end - mode->hsync_start);
+	if (hdmi->xvidc_colorfmt == HDMI_TX_CSF_YCRCB_420) {
+		if (hactive & 0x1 || hfront_porch & 0x1 ||
+		    hback_porch & 0x1 || hsync_len & 0x1)
+			dev_dbg(hdmi->dev, "VTC does not support this timing\n");
+
+		hactive = hactive / 2;
+		hfront_porch = hfront_porch / 2;
+		hback_porch = hback_porch / 2;
+		hsync_len = hsync_len / 2;
+	}
+	htotal = hactive + hfront_porch + hsync_len + hback_porch;
+	hsync_start = hactive + hfront_porch;
+	hbackporch_start = hsync_start + hsync_len;
+
+	vactive = mode->vdisplay;
+	vfront_porch = mode->vsync_start - mode->vdisplay;
+	vback_porch = mode->vtotal - mode->vsync_end;
+	vsync_len = mode->vsync_end - mode->vsync_start;
+	vtotal = vactive + vfront_porch + vsync_len + vback_porch;
+	vsync_start = vactive + vfront_porch;
+	vbackporch_start = vsync_start + vsync_len;
+
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_CTL, reg & ~HDMI_TX_VTC_CTL_RU);
+
+	reg = htotal & HDMI_TX_VTC_GHSIZE_FRAME_HSIZE;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GHSIZE, reg);
+
+	reg = vtotal & HDMI_TX_VTC_GVSIZE_FRAME_VSIZE;
+	reg |= reg << HDMI_TX_VTC_FIELD1_VSIZE_SHIFT;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GVSIZE, reg);
+
+	reg = hactive & HDMI_TX_VTC_ACTIVE_SIZE_MASK;
+	reg |= (vactive & HDMI_TX_VTC_ACTIVE_SIZE_MASK) <<
+		HDMI_TX_VTC_FIELD1_VSIZE_SHIFT;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GASIZE_F0, reg);
+
+	reg = hsync_start & HDMI_TX_VTC_GHSYNC_START_MASK;
+	reg |= (hbackporch_start << HDMI_TX_VTC_GH1BPSTART_SHIFT) &
+		HDMI_TX_VTC_GHSYNC_END_MASK;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GHSYNC, reg);
+
+	reg = (vsync_start - 1) & HDMI_TX_VTC_F0_VSYNC_VSTART_MASK;
+	reg |= ((vbackporch_start - 1) << HDMI_TX_VTC_FIELD1_VSIZE_SHIFT) &
+		HDMI_TX_VTC_F0_VSYNC_VEND_MASK;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GVSYNC, reg);
+	xlnx_hdmi_vtc_clr(hdmi, HDMI_TX_VTC_GFENC,
+		      HDMI_TX_VTC_GFENC_MASK);
+
+	/* Calculate and uppdate Generator VBlank Hori field 0 */
+	reg = hactive & HDMI_TX_VTC_F0VBLANK_HSTART_MASK;
+	reg |= (hactive << HDMI_TX_VTC_F0VSYNC_HEND_SHIFT) &
+		HDMI_TX_VTC_F0VBLANK_HEND_MASK;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GVBHOFF, reg);
+
+	/* Calculate and update Generator VSync Hori field 0 */
+	reg = hsync_start & HDMI_TX_VTC_F0VBLANK_HSTART_MASK;
+	reg |= (hsync_start << HDMI_TX_VTC_F0VSYNC_HEND_SHIFT) &
+		HDMI_TX_VTC_F0VBLANK_HEND_MASK;
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GVSHOFF, reg);
+
+	/* sets all polarities as active high */
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_GPOL, HDMI_TX_VTC_GPOL_MASK);
+	/* configure timing source */
+	xlnx_hdmi_vtc_writel(hdmi, HDMI_TX_VTC_CTL, HDMI_TX_VTC_CTL_MASK |
+			     HDMI_TX_VTC_CTL_RU);
 }
 
 static const struct drm_edid *xlnx_hdmi_edid_read(struct xlnx_hdmi *hdmi,
@@ -184,23 +392,123 @@ static void xlnx_hdmi_encoder_dpms(struct drm_encoder *encoder, int dpms)
 
 static void xlnx_hdmi_encoder_enable(struct drm_encoder *encoder)
 {
-	// struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
+	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
 
 	xlnx_hdmi_encoder_dpms(encoder, DRM_MODE_DPMS_ON);
-	// xlnx_hdmi_vtc_enable(hdmi);
+	xlnx_hdmi_vtc_enable(hdmi);
 
 	// xlnx_hdmi_ext_sysrst_deassert(hdmi);
 }
 
 static void xlnx_hdmi_encoder_disable(struct drm_encoder *encoder)
 {
-	// struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
+	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
 
 	xlnx_hdmi_encoder_dpms(encoder, DRM_MODE_DPMS_OFF);
 
 	/* Disable the EXT VRST which actually starts the bridge */
 	// xlnx_hdmi_ext_sysrst_assert(hdmi);
-	// xlnx_hdmi_vtc_disable(hdmi);
+	xlnx_hdmi_vtc_disable(hdmi);
+}
+
+/**
+ * xlnx_hdmi_find_media_bus - finds drm_fourcc equivalent format
+ * @hdmi: pointer to HDMI TX core instance
+ * @drm_fourcc: drm fourcc code
+ *
+ */
+static void
+xlnx_hdmi_find_media_bus(struct xlnx_hdmi *hdmi,
+				       u32 drm_fourcc)
+{
+	switch (drm_fourcc) {
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_BGR888:
+	case DRM_FORMAT_RGB888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_ABGR8888:
+	case MEDIA_BUS_FMT_RGB888_1X24:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_8;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_RGB;
+		break;
+	case DRM_FORMAT_XBGR2101010:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_10;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_RGB;
+		break;
+	case DRM_FORMAT_VUY888:
+	case DRM_FORMAT_XVUY8888:
+	case DRM_FORMAT_Y8:
+	case DRM_FORMAT_YUV444:
+	case MEDIA_BUS_FMT_VUY8_1X24:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_8;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_444;
+		break;
+	case DRM_FORMAT_XVUY2101010:
+	case DRM_FORMAT_Y10:
+	case DRM_FORMAT_X403:
+	case MEDIA_BUS_FMT_VUY10_1X30:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_10;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_444;
+		break;
+	/* TODO: Fix using DRM and media formats in same switch case */
+	case DRM_FORMAT_X423:
+	case MEDIA_BUS_FMT_VUY12_1X36:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_12;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_444;
+		break;
+	case DRM_FORMAT_YUYV:
+	case DRM_FORMAT_UYVY:
+	case DRM_FORMAT_NV16:
+	case MEDIA_BUS_FMT_UYVY8_1X16:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_8;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_422;
+		break;
+	case DRM_FORMAT_XV20:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_10;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_422;
+		break;
+	case DRM_FORMAT_NV12:
+	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_8;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_420;
+		break;
+	case DRM_FORMAT_XV15:
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_10;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_YCRCB_420;
+		break;
+	default:
+		dev_err(hdmi->dev, "Unknown drm fmt: %d\n", drm_fourcc);
+		hdmi->xvidc_colordepth = HDMI_TX_BPC_8;
+		hdmi->xvidc_colorfmt = HDMI_TX_CSF_RGB;
+	}
+}
+
+static u64 xlnx_hdmi_get_tmdsclk(struct xlnx_hdmi *hdmi, struct drm_display_mode *adjusted_mode)
+{
+	u64 tmdsclk;
+
+	tmdsclk = adjusted_mode->clock * 1000;
+	if (hdmi->xvidc_colorfmt == HDMI_TX_CSF_YCRCB_420)
+		tmdsclk = tmdsclk >> 1;
+
+	if (hdmi->xvidc_colorfmt != HDMI_TX_CSF_YCRCB_422) {
+		switch (hdmi->xvidc_colordepth) {
+		case HDMI_TX_BPC_10:
+			tmdsclk = (tmdsclk * 5) >> 2;
+			break;
+		case HDMI_TX_BPC_12:
+			tmdsclk = (tmdsclk * 3) >> 1;
+			break;
+		case HDMI_TX_BPC_16:
+			tmdsclk = tmdsclk << 1;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return tmdsclk;
 }
 
 /**
@@ -218,7 +526,68 @@ xlnx_hdmi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 				  struct drm_crtc_state *crtc_state,
 				  struct drm_connector_state *connector_state)
 {
-	// TODO: modeset
+	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
+	struct drm_display_mode *mode = &crtc_state->mode;
+	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
+	// union phy_configure_opts phy_cfg = {0};
+	// int ret;
+	u32 drm_fourcc;
+
+	drm_mode_copy(&hdmi->saved_adjusted_mode, &crtc_state->adjusted_mode);
+	dev_dbg(hdmi->dev, "mode->clock = %d\n", mode->clock * 1000);
+	dev_dbg(hdmi->dev, "mode->crtc_clock = %d\n", mode->crtc_clock * 1000);
+	dev_dbg(hdmi->dev, "mode->pvsync = %d\n",
+		!!(mode->flags & DRM_MODE_FLAG_PVSYNC));
+	dev_dbg(hdmi->dev, "mode->phsync = %d\n",
+		!!(mode->flags & DRM_MODE_FLAG_PHSYNC));
+	dev_dbg(hdmi->dev, "mode->hsync_end = %d\n", mode->hsync_end);
+	dev_dbg(hdmi->dev, "mode->hsync_start = %d\n", mode->hsync_start);
+	dev_dbg(hdmi->dev, "mode->vsync_end = %d\n", mode->vsync_end);
+	dev_dbg(hdmi->dev, "mode->vsync_start = %d\n", mode->vsync_start);
+	dev_dbg(hdmi->dev, "mode->hdisplay = %d\n", mode->hdisplay);
+	dev_dbg(hdmi->dev, "mode->vdisplay = %d\n", mode->vdisplay);
+	dev_dbg(hdmi->dev, "mode->htotal = %d\n", mode->htotal);
+	dev_dbg(hdmi->dev, "mode->vtotal = %d\n", mode->vtotal);
+	dev_dbg(hdmi->dev, "mode->vrefresh = %d\n", drm_mode_vrefresh(mode));
+	dev_dbg(hdmi->dev, "mode->flags = %d interlace = %d\n", mode->flags,
+		!!(mode->flags & DRM_MODE_FLAG_INTERLACE));
+
+	drm_fourcc = encoder->crtc->primary->state->fb->format->format;
+
+	xlnx_hdmi_find_media_bus(hdmi, drm_fourcc);
+	dev_dbg(hdmi->dev, "xvidc_colorfmt = %d\n", hdmi->xvidc_colorfmt);
+	dev_dbg(hdmi->dev, "xvidc_colordepth = %d\n", hdmi->xvidc_colordepth);
+
+	hdmi->tmds_clk = xlnx_hdmi_get_tmdsclk(hdmi, adjusted_mode);
+	dev_dbg(hdmi->dev, "tmds_clk = %llu\n", hdmi->tmds_clk);
+
+	// /* Assert VID_IN bridge resets */
+	// xlnx_hdmi_ext_sysrst_assert(hdmi);
+	// xlnx_hdmi_ext_vrst_assert(hdmi);
+
+	// /* Assert HDMI TXCore resets */
+	// xlnx_hdmi_int_lrst_assert(hdmi);
+
+	// phy_cfg.hdmi.tx_params = 1;
+	// phy_cfg.hdmi.ppc = config->ppc;
+	// phy_cfg.hdmi.bpc = hdmi->xvidc_colordepth;
+	// phy_cfg.hdmi.fmt = hdmi->xvidc_colorfmt;
+	// phy_cfg.hdmi.tx_tmdsclk = hdmi->tmds_clk;
+	// ret = xlnx_hdmi_phy_configure(hdmi, &phy_cfg);
+	// if (ret) {
+	// 	dev_err(hdmi->dev, "phy_config: set txparams error %d\n", ret);
+	// 	return;
+	// }
+
+	xlnx_hdmi_vtc_set_timing(hdmi, adjusted_mode);
+
+	// After stream up
+	// /* release vid_in bridge resets */
+	// xlnx_hdmi_ext_sysrst_deassert(hdmi);
+	// xlnx_hdmi_ext_vrst_deassert(hdmi);
+	// /* release tx core resets */
+	// xlnx_hdmi_int_lrst_deassert(hdmi);
+	// xlnx_hdmi_int_vrst_deassert(hdmi);
 }
 
 static const struct
