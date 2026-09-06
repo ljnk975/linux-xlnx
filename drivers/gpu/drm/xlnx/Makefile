@@ -15,6 +15,7 @@ obj-$(CONFIG_DRM_XLNX_BRIDGE_VTC) += xlnx_vtc.o
 obj-$(CONFIG_DRM_XLNX_DPTX) += xlnx_dptx.o
 obj-$(CONFIG_DRM_XLNX_DSI) += xlnx_dsi.o
 obj-$(CONFIG_DRM_XLNX_HDMITX) += xlnx_hdmi.o
+obj-$(CONFIG_DRM_XLNX_HDMITX_MIN) += xlnx_hdmi_min.o
 obj-$(CONFIG_DRM_XLNX_MIXER) += xlnx_mixer.o
 obj-$(CONFIG_DRM_XLNX_PL_DISP) += xlnx_pl_disp.o
 xlnx-sdi-objs += xlnx_sdi.o xlnx_sdi_timing.o
