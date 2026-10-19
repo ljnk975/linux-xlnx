@@ -2960,10 +2960,10 @@ static inline void fbcon_select_primary(struct fb_info *info)
 }
 #endif /* CONFIG_FRAMEBUFFER_DETECT_PRIMARY */
 
-static bool lockless_register_fb;
+static bool lockless_register_fb = 1;
 module_param_named_unsafe(lockless_register_fb, lockless_register_fb, bool, 0400);
 MODULE_PARM_DESC(lockless_register_fb,
-	"Lockless framebuffer registration for debugging [default=off]");
+	"Lockless framebuffer registration for debugging [default=on]");
 
 /* called with console_lock held */
 static int do_fb_registered(struct fb_info *info)
