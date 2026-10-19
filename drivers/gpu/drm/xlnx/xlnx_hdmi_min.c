@@ -10,7 +10,9 @@
 #include <linux/component.h>
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
+#include <linux/clk.h>
 #include <linux/i2c.h>
+#include <linux/gpio/consumer.h>
 
 #include <drm/drm_of.h>
 #include <drm/drm_connector.h>
@@ -26,10 +28,10 @@
 #define hdmi_mutex_lock(x)	mutex_lock(x)
 #define hdmi_mutex_unlock(x)	mutex_unlock(x)
 
-#define HDMI_TX_PIXEL_MAXRATE	2376000
+#define HDMI_TX_PIXEL_MAXRATE	150000
 
 /* VTC register offsets and bit masks */
-#define HDMI_TX_VTC_BASE			0x10000
+#define HDMI_TX_VTC_BASE		0x0
 
 #define HDMI_TX_VTC_CTL			0x000
 #define HDMI_TX_VTC_CTL_MASK			GENMASK(18, 8)
@@ -109,6 +111,8 @@ enum color_depths {
  * @base: device I/O memory for register access
  * @encoder: the drm encoder structure
  * @connector: the drm connector structure
+ * @pixel_clk: pixel clock handle
+ * @reset: reset gpio handle
  * @ddc: i2c ddc handle
  * @hdmi_mutex: mutex to lock hdmi structure
  * @dpms: current dpms state
@@ -122,6 +126,8 @@ struct xlnx_hdmi {
 	void __iomem *base;
 	struct drm_encoder encoder;
 	struct drm_connector connector;
+	struct clk *pixel_clk;
+	struct gpio_desc *reset;
 	struct i2c_adapter *ddc;
 	/* to lock hdmi */
 	struct mutex hdmi_mutex;
@@ -348,21 +354,20 @@ static int xlnx_hdmi_connector_get_modes(struct drm_connector *connector)
 {
 	struct xlnx_hdmi *hdmi = connector_to_hdmi(connector);
 	const struct drm_edid *drm_edid;
-	int ret;
+	int count = 0;
 
 	drm_edid = xlnx_hdmi_edid_read(hdmi, connector);
 
 	drm_edid_connector_update(connector, drm_edid);
 
-	if (!drm_edid) {
-		dev_info(hdmi->dev, "no edid, assume <= 1024x768 works\n");
-		return 0;
+	if (drm_edid) {
+		count = drm_edid_connector_add_modes(connector);
+		drm_edid_free(drm_edid);
 	}
 
-	ret = drm_edid_connector_add_modes(connector);
-	drm_edid_free(drm_edid);
+	dev_dbg(hdmi->dev, "xlnx_hdmi_connector_get_modes %d\n", count);
 
-	return ret;
+	return count;
 }
 
 static struct drm_encoder *
@@ -396,8 +401,6 @@ static void xlnx_hdmi_encoder_enable(struct drm_encoder *encoder)
 
 	xlnx_hdmi_encoder_dpms(encoder, DRM_MODE_DPMS_ON);
 	xlnx_hdmi_vtc_enable(hdmi);
-
-	// xlnx_hdmi_ext_sysrst_deassert(hdmi);
 }
 
 static void xlnx_hdmi_encoder_disable(struct drm_encoder *encoder)
@@ -405,10 +408,10 @@ static void xlnx_hdmi_encoder_disable(struct drm_encoder *encoder)
 	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
 
 	xlnx_hdmi_encoder_dpms(encoder, DRM_MODE_DPMS_OFF);
-
-	/* Disable the EXT VRST which actually starts the bridge */
-	// xlnx_hdmi_ext_sysrst_assert(hdmi);
 	xlnx_hdmi_vtc_disable(hdmi);
+
+	/* Assert HDMI TXCore reset */
+	gpiod_set_value(hdmi->reset, 1);
 }
 
 /**
@@ -529,8 +532,7 @@ xlnx_hdmi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
 	struct drm_display_mode *mode = &crtc_state->mode;
 	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
-	// union phy_configure_opts phy_cfg = {0};
-	// int ret;
+	int ret;
 	u32 drm_fourcc;
 
 	drm_mode_copy(&hdmi->saved_adjusted_mode, &crtc_state->adjusted_mode);
@@ -561,33 +563,14 @@ xlnx_hdmi_encoder_atomic_mode_set(struct drm_encoder *encoder,
 	hdmi->tmds_clk = xlnx_hdmi_get_tmdsclk(hdmi, adjusted_mode);
 	dev_dbg(hdmi->dev, "tmds_clk = %llu\n", hdmi->tmds_clk);
 
-	// /* Assert VID_IN bridge resets */
-	// xlnx_hdmi_ext_sysrst_assert(hdmi);
-	// xlnx_hdmi_ext_vrst_assert(hdmi);
+	/* Deassert HDMI TXCore reset */
+	gpiod_set_value(hdmi->reset, 0);
 
-	// /* Assert HDMI TXCore resets */
-	// xlnx_hdmi_int_lrst_assert(hdmi);
-
-	// phy_cfg.hdmi.tx_params = 1;
-	// phy_cfg.hdmi.ppc = config->ppc;
-	// phy_cfg.hdmi.bpc = hdmi->xvidc_colordepth;
-	// phy_cfg.hdmi.fmt = hdmi->xvidc_colorfmt;
-	// phy_cfg.hdmi.tx_tmdsclk = hdmi->tmds_clk;
-	// ret = xlnx_hdmi_phy_configure(hdmi, &phy_cfg);
-	// if (ret) {
-	// 	dev_err(hdmi->dev, "phy_config: set txparams error %d\n", ret);
-	// 	return;
-	// }
+	ret = clk_set_rate(hdmi->pixel_clk, adjusted_mode->clock * 1000);
+	if (ret < 0)
+		dev_err(hdmi->dev, "failed to set pixel clock rate: %d\n", ret);
 
 	xlnx_hdmi_vtc_set_timing(hdmi, adjusted_mode);
-
-	// After stream up
-	// /* release vid_in bridge resets */
-	// xlnx_hdmi_ext_sysrst_deassert(hdmi);
-	// xlnx_hdmi_ext_vrst_deassert(hdmi);
-	// /* release tx core resets */
-	// xlnx_hdmi_int_lrst_deassert(hdmi);
-	// xlnx_hdmi_int_vrst_deassert(hdmi);
 }
 
 static const struct
@@ -645,6 +628,7 @@ static int xlnx_hdmi_bind(struct device *dev, struct device *master,
 	int ret;
 
 	encoder->possible_crtcs = 1;
+
 	/* initialize encoder */
 	drm_encoder_init(drm_dev, encoder, &xlnx_hdmi_encoder_funcs,
 			 DRM_MODE_ENCODER_TMDS, NULL);
@@ -693,6 +677,27 @@ static int xlnx_hdmi_parse_of(struct xlnx_hdmi *hdmi)
 {
 	struct device_node *node = hdmi->dev->of_node;
 	struct device_node *ddc_node;
+	int ret;
+
+	hdmi->pixel_clk = devm_clk_get(hdmi->dev, "pixel_clk");
+	if (IS_ERR(hdmi->pixel_clk)) {
+		ret = PTR_ERR(hdmi->pixel_clk);
+		dev_err(hdmi->dev, "failed to get pixel_clk %d\n", ret);
+		return ret;
+	}
+
+	ret = clk_prepare_enable(hdmi->pixel_clk);
+	if (ret) {
+		dev_err(hdmi->dev, "unable to enable pixel_clk %d\n", ret);
+		return ret;
+	}
+
+	hdmi->reset = devm_gpiod_get(hdmi->dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(hdmi->reset)) {
+		ret = PTR_ERR(hdmi->reset);
+		dev_err(hdmi->dev, "Failed to get reset line %d\n", ret);
+		return ret;
+	}
 
 	ddc_node = of_parse_phandle(node, "ddc-i2c-bus", 0);
 	if (ddc_node) {
@@ -749,7 +754,7 @@ static void xlnx_hdmi_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id xlnx_hdmi_of_match[] = {
-	{ .compatible = "xlnx,v-hdmi-tx-min-v1.0" },
+	{ .compatible = "xlnx,v-hdmi-tx-min-1.0" },
 	{ /* end of table */ },
 };
 
